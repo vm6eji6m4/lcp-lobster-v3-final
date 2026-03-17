@@ -27,7 +27,6 @@ AGENT_READ: true
 11. [快速開始 / Quick Start](#快速開始--quick-start)
 12. [故障排除 / Troubleshooting](#故障排除--troubleshooting)
 13. [專案結構 / Project Structure](#專案結構--project-structure)
-14. [混合模式 / Hybrid Mode](#混合模式--hybrid-mode)
 
 ---
 
@@ -542,20 +541,20 @@ status:uncertain|confidence:x  → translation confidence too low
 ## 專案結構 / Project Structure
 
 ```
-lcp.py  (single file, ~1580 lines)
+lcp.py  (single file, 1416 lines)
 │
 ├── §1   Constants & utilities
 ├── §2   Platform adapter       ← auto-detects macOS / WSL / Windows
 ├── §3   Challenge solver       ← obfuscated math auto-decode
 ├── §4   Translation store      ← SQLite + hot cache + lifecycle
 ├── §5   Sandbox                ← state machine + EA loop
-├── §6   Ollama handler         ← local model calls + lcp_to_natural()
+├── §6   Ollama handler         ← local model calls
 ├── §7   Moltbook watcher       ← API version tracking
 ├── §8   Moltbook handler       ← full official API implementation
 ├── §9   Translator             ← natural language → LCP
-├── §10  LCP parser             ← main entry + OutputMode + hybrid methods
+├── §10  LCP parser             ← main entry point
 ├── §11  Setup tool             ← interactive setup wizard
-├── §12  Test suite             ← 52/53 pass (includes hybrid tests)
+├── §12  Test suite             ← 45/46 pass
 └── §13  CLI                    ← python3 lcp.py <cmd>
 
 LCP_README.md    ← this file (human + agent readable)
@@ -635,132 +634,6 @@ L|CA|openweather|taipei|E   ← 7B 跑：~15 tokens（一樣）
 Larger model → slower inference (not more tokens)
 ```
 
----
-
-## 混合模式 / Hybrid Mode
-
-> **v3.1 新功能** — 解決「內部省 token，對外別人看不懂」的核心矛盾  
-> **v3.1 New** — Solves the core conflict: save tokens internally, but be readable externally
-
-### 問題 / The Problem
-
-```
-純 LCP 輸出（別人看不懂）:
-  L|RP|status:ok|source:openweather|city:taipei|data:晴天28度|E
-
-混合模式輸出（人類看得懂）:
-  今天台北天氣晴天，氣溫 28 度，很適合出門～
-```
-
-### 三種輸出模式 / Three Output Modes
-
-| 模式 / Mode | 內部處理 | 對外輸出 | 適用場景 |
-|---|---|---|---|
-| `lcp` (預設) | LCP | LCP | 純內部、龍蝦對龍蝦 |
-| `natural` | LCP | 自然語言 | 回覆人類 |
-| `hybrid` | LCP | 自然語言 + MB 自動翻譯 | 上 Moltbook 發文 |
-
-### 流程圖 / Flow Diagram
-
-```
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│   Input      │     │   Internal   │     │   Output     │
-│  (LCP 指令)  │────▶│  LCP 執行    │────▶│  自然語言    │
-│              │     │  CA/SK/RM    │     │  (7B 翻譯)   │
-└──────────────┘     └──────┬───────┘     └──────────────┘
-                            │
-                     ┌──────▼───────┐
-                     │  SK 記憶庫    │  ← 存原始 LCP 結果
-                     │  (保留完整   │
-                     │   LCP 格式)  │
-                     └──────┬───────┘
-                            │
-                     ┌──────▼───────┐
-                     │  MB 發文     │  ← 發翻譯後的自然語言
-                     │  (人話版本)  │
-                     └──────────────┘
-```
-
-### 使用方法 / Usage
-
-```bash
-# 基礎混合模式：內部 LCP，輸出自然語言
-python3 lcp.py hybrid \
-  'L|CA|openweather|taipei|E' \
-  'L|SK|weather_today|晴天28度|E' \
-  'L|RM|last|E'
-
-# 輸出：
-#   lcp_output:     L|RP|status:ok|key:last|value:stub|E
-#   natural_output: 執行完成。key: last  value: stub
-
-# 混合 + Moltbook（MB 發文自動轉自然語言）
-python3 lcp.py hybrid --mb \
-  'L|CA|openweather|taipei|E' \
-  'L|SK|weather_today|晴天28度|E' \
-  'L|MB|general|今日天氣|晴天28度|E'
-
-# SK 存的是：weather_today = 晴天28度（原始 LCP）
-# MB 發的是：「今天台北天氣晴天，氣溫 28 度～」（自然語言）
-```
-
-### 程式碼整合 / Code Integration
-
-```python
-from lcp import LCPParser
-
-# 初始化混合模式
-parser = LCPParser(output_mode="hybrid")
-
-# 方法 1：run_hybrid — 內部 LCP，最終翻譯
-r = parser.run_hybrid(["L|CA|openweather|taipei|E"])
-print(r.output)          # L|RP|status:ok|...|E  （內部 LCP）
-print(r.natural_output)  # 今天台北天氣晴天...    （對外自然語言）
-
-# 方法 2：run_hybrid_mb — MB 發文自動翻譯
-r = parser.run_hybrid_mb([
-    "L|CA|openweather|taipei|E",
-    "L|SK|weather_today|晴天28度|E",
-    "L|MB|general|今日天氣|晴天28度|E",
-])
-# SK 記錄原始 LCP → MB 發出人話版本
-```
-
-### 翻譯層設計 / Translation Layer
-
-```
-有 Ollama（在線）:
-  LCP RP 結果 → 7B 模型翻譯 → 自然語言
-  prompt 極短（~30 token），不會吃掉省下的 token
-
-無 Ollama（離線）:
-  LCP RP 結果 → fallback 解析器 → 基礎自然語言
-  自動提取 RP 欄位，組合成可讀文字
-  例：L|RP|status:ok|city:taipei|data:晴天28度|E
-    → 「執行完成。city: taipei  data: 晴天28度」
-```
-
-### 為什麼這樣設計 / Design Rationale
-
-```
-Input → LCP(內部) → AI → 自然語言 Output(對外)
-
-✅ 內部省 token（LCP 壓縮 ~55%）
-✅ 對外看得懂（自然語言輸出）
-✅ SK 記憶庫保留原始 LCP（未來龍蝦互通用）
-✅ 翻譯 prompt 極短（不浪費省下的 token）
-✅ Ollama 離線時自動 fallback（不會卡住）
-```
-
----
-
-## 未來規劃 / Roadmap
-
-- [ ] **Signature verification** — HMAC per message, prevent tampering
-- [ ] **Version compatibility layer** — v1/v2 message auto-conversion
-- [ ] **State serialization** — resume execution after agent restart
-- [ ] **Multi-lobster collaboration** — agent-to-agent LCP forwarding
-- [ ] **Dynamic decision (v4)** — sandboxed runtime branching
 
 ---
 
@@ -771,10 +644,4 @@ Free to use and adapt. Attribution appreciated.
 
 ---
 
-*這隻龍蝦，是我親手養大的。—— 國裕 2026.03.14* 🦞  
 *This lobster was raised by hand. — Guoyu, 2026.03.14*
-#   l c p - l o b s t e r - v 3 
- 
- #   l c p - l o b s t e r - v 3 
- 
- 
