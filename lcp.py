@@ -435,6 +435,18 @@ class MemoryStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_mem_tags
                     ON lcp_memory(tags);
+                CREATE TABLE IF NOT EXISTS lcp_memory_edges (
+                    source    TEXT NOT NULL,
+                    target    TEXT NOT NULL,
+                    relation  TEXT DEFAULT 'related',
+                    weight    REAL DEFAULT 1.0,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (source, target)
+                );
+                CREATE INDEX IF NOT EXISTS idx_edge_source
+                    ON lcp_memory_edges(source);
+                CREATE INDEX IF NOT EXISTS idx_edge_target
+                    ON lcp_memory_edges(target);
             """)
             # schema 升級：如果舊表沒有 summary 欄位就加上
             try:
@@ -468,6 +480,8 @@ class MemoryStore:
                              updated_at=excluded.updated_at,
                              access_count=access_count+1""",
                       (key, value, summary, tags, ts, ts))
+        # v3.4: 自動建立圖譜關聯
+        self.auto_link(key)
         return True, "saved"
 
     def needs_summary(self, value: str) -> bool:
@@ -575,7 +589,129 @@ class MemoryStore:
     def stats(self) -> dict:
         with self._conn() as c:
             row = c.execute("SELECT COUNT(*) cnt, SUM(access_count) total_access FROM lcp_memory").fetchone()
-        return {"count": row["cnt"], "total_access": row["total_access"] or 0}
+            # 分層統計
+            tiers = {}
+            for tier_name in ("core", "daily", "cache"):
+                t = c.execute("SELECT COUNT(*) cnt FROM lcp_memory WHERE LOWER(tags) LIKE ?",
+                              (f"%{tier_name}%",)).fetchone()
+                tiers[tier_name] = t["cnt"]
+            other = c.execute(
+                "SELECT COUNT(*) cnt FROM lcp_memory WHERE LOWER(tags) NOT LIKE '%core%' AND LOWER(tags) NOT LIKE '%daily%' AND LOWER(tags) NOT LIKE '%cache%'"
+            ).fetchone()
+            tiers["other"] = other["cnt"]
+        return {"count": row["cnt"], "total_access": row["total_access"] or 0, "tiers": tiers}
+
+    # ── 記憶圖譜 (Memory Graph) v3.4 ──────────────────────
+
+    def link(self, source: str, target: str, relation: str = "related", weight: float = 1.0) -> bool:
+        """建立兩筆記憶之間的關聯"""
+        ts = _now()
+        try:
+            with self._conn() as c:
+                c.execute("""INSERT OR REPLACE INTO lcp_memory_edges
+                             (source, target, relation, weight, created_at)
+                             VALUES (?, ?, ?, ?, ?)""",
+                          (source, target, relation, weight, ts))
+            return True
+        except Exception:
+            return False
+
+    def unlink(self, source: str, target: str) -> bool:
+        """移除兩筆記憶之間的關聯"""
+        with self._conn() as c:
+            cur = c.execute("DELETE FROM lcp_memory_edges WHERE source=? AND target=?",
+                            (source, target))
+        return cur.rowcount > 0
+
+    def get_related(self, key: str, depth: int = 1, limit: int = 5) -> list:
+        """圖譜檢索：取得與 key 相關的記憶（支援多層深度）
+        
+        depth=1: 直接關聯（A→B）
+        depth=2: 二度關聯（A→B→C）
+        
+        回傳 list of (MemoryRecord, relation, depth)
+        """
+        visited = {key}
+        results = []
+        current_keys = [key]
+
+        for d in range(1, depth + 1):
+            next_keys = []
+            for k in current_keys:
+                with self._conn() as c:
+                    # 雙向查詢：source→target 和 target→source
+                    rows = c.execute(
+                        """SELECT target AS linked_key, relation, weight FROM lcp_memory_edges WHERE source=?
+                           UNION
+                           SELECT source AS linked_key, relation, weight FROM lcp_memory_edges WHERE target=?""",
+                        (k, k)).fetchall()
+                for row in rows:
+                    lk = row["linked_key"]
+                    if lk in visited:
+                        continue
+                    visited.add(lk)
+                    rec = self.recall(lk)
+                    if rec:
+                        results.append((rec, row["relation"], d))
+                        next_keys.append(lk)
+            current_keys = next_keys
+            if not current_keys:
+                break
+
+        # 排序：depth 淺的優先，同 depth 按 weight 降序
+        results.sort(key=lambda x: (x[2], -1))
+        return results[:limit]
+
+    def get_edges(self, key: str) -> list:
+        """取得某筆記憶的所有邊（直接關聯）"""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT source, target, relation, weight FROM lcp_memory_edges
+                   WHERE source=? OR target=?""",
+                (key, key)).fetchall()
+        return [{"source": r["source"], "target": r["target"],
+                 "relation": r["relation"], "weight": r["weight"]} for r in rows]
+
+    def auto_link(self, key: str):
+        """自動建立關聯：根據 tags 和 key prefix 找到相似記憶並 link
+        
+        規則：
+        1. 相同 tag → 建立 'same_tag' 關聯（weight=0.5）
+        2. 相同 key prefix（冒號前） → 建立 'same_group' 關聯（weight=0.8）
+        3. value/summary 有重疊關鍵字 → 建立 'content_related' 關聯（weight=0.3）
+        """
+        rec = self.recall(key)
+        if not rec:
+            return
+        # 規則 1：相同 tag
+        if rec.tags:
+            for tag in rec.tags.split(","):
+                tag = tag.strip().lower()
+                if not tag or tag in ("core", "daily", "cache"):
+                    continue
+                with self._conn() as c:
+                    rows = c.execute(
+                        "SELECT key FROM lcp_memory WHERE key != ? AND LOWER(tags) LIKE ?",
+                        (key, f"%{tag}%")).fetchall()
+                for r in rows:
+                    self.link(key, r["key"], f"same_tag:{tag}", 0.5)
+
+        # 規則 2：相同 key prefix
+        if ":" in key:
+            prefix = key.split(":")[0]
+            with self._conn() as c:
+                rows = c.execute(
+                    "SELECT key FROM lcp_memory WHERE key != ? AND key LIKE ?",
+                    (key, f"{prefix}:%")).fetchall()
+            for r in rows:
+                self.link(key, r["key"], "same_group", 0.8)
+
+    def graph_stats(self) -> dict:
+        """圖譜統計"""
+        with self._conn() as c:
+            edge_count = c.execute("SELECT COUNT(*) cnt FROM lcp_memory_edges").fetchone()["cnt"]
+            node_count = c.execute("SELECT COUNT(DISTINCT source) + COUNT(DISTINCT target) cnt FROM lcp_memory_edges").fetchone()["cnt"]
+        return {"edges": edge_count, "connected_nodes": node_count}
 
     def close(self):
         pass  # sqlite3 with-statement 自動關閉
@@ -1257,15 +1393,15 @@ class LCPParser:
         return result
 
     def _auto_context(self, chain: list) -> str:
-        """自動相關性匹配 + 核心記憶優先載入
+        """自動相關性匹配 + 核心記憶 + 圖譜擴展
         
-        借鑑 Adam Framework 的分層概念：
+        三步驟：
         1. core 標籤的記憶永遠載入（像 Adam 的 SOUL.md）
-        2. 再從指令參數搜尋相關記憶
-        3. 最多帶 5 筆，避免 context 爆掉
+        2. 從指令參數搜尋相關記憶（關鍵字匹配）
+        3. v3.4: 圖譜擴展 — 對搜到的記憶做 1 度展開，帶出關聯記憶
         
         回傳格式（極短，省 token）：
-          [CORE] key:摘要 | [MEM] key:摘要
+          [CORE] key:摘要 | key:摘要 | [GRAPH] key:摘要
         """
         if self.memory.stats()["count"] == 0:
             return ""
@@ -1278,6 +1414,7 @@ class LCPParser:
             preview = r.summary if r.summary else (r.value[:80] if len(r.value) > 80 else r.value)
             hits.append(f"[CORE]{r.key}:{preview}")
         # 第二步：從 chain 提取關鍵字搜尋
+        search_hit_keys = []
         keywords = set()
         for raw in chain:
             msg = _parse_lcp(raw)
@@ -1293,9 +1430,18 @@ class LCPParser:
                     seen_keys.add(r.key)
                     preview = r.summary if r.summary else (r.value[:80] if len(r.value) > 80 else r.value)
                     hits.append(f"{r.key}:{preview}")
+                    search_hit_keys.append(r.key)
+        # 第三步：圖譜擴展 — 對搜到的記憶做 1 度展開
+        for sk in search_hit_keys[:3]:  # 最多展開前 3 筆的關聯
+            related = self.memory.get_related(sk, depth=1, limit=2)
+            for rec, relation, depth in related:
+                if rec.key not in seen_keys:
+                    seen_keys.add(rec.key)
+                    preview = rec.summary if rec.summary else (rec.value[:60] if len(rec.value) > 60 else rec.value)
+                    hits.append(f"[G]{rec.key}:{preview}")
         if not hits:
             return ""
-        return " | ".join(hits[:5])
+        return " | ".join(hits[:7])  # 最多 7 筆（core + search + graph）
 
     def run(self, raw: str) -> ExecutionResult:
         msg = _parse_lcp(raw)
@@ -1437,6 +1583,32 @@ class LCPParser:
         if key == "stats":
             s = self.memory.stats()
             return f"L|RP|status:ok|count:{s['count']}|total_access:{s['total_access']}|E"
+        # 特殊指令：graph:key → 查看關聯記憶（圖譜檢索）
+        if key.startswith("graph:"):
+            gkey = key[6:]
+            related = self.memory.get_related(gkey, depth=2, limit=5)
+            if not related:
+                return f"L|RP|status:ok|key:graph|found:0|E"
+            hits = ";".join(f"{rec.key}({rel},d{d})={rec.summary or rec.value[:40]}"
+                           for rec, rel, d in related)
+            return f"L|RP|status:ok|key:graph|found:{len(related)}|hits:{hits}|E"
+        # 特殊指令：link:source:target:relation → 手動建立關聯
+        if key.startswith("link:"):
+            parts = key[5:].split(":")
+            if len(parts) >= 2:
+                source, target = parts[0], parts[1]
+                relation = parts[2] if len(parts) > 2 else "related"
+                ok = self.memory.link(source, target, relation)
+                return f"L|RP|status:ok|linked:{source}→{target}|relation:{relation}|E"
+            return "L|RP|status:err|code:INVALID_LINK_FORMAT|E"
+        # 特殊指令：edges:key → 查看某筆記憶的所有邊
+        if key.startswith("edges:"):
+            ekey = key[6:]
+            edges = self.memory.get_edges(ekey)
+            if not edges:
+                return f"L|RP|status:ok|key:edges|count:0|E"
+            estr = ";".join(f"{e['source']}→{e['target']}({e['relation']})" for e in edges)
+            return f"L|RP|status:ok|key:edges|count:{len(edges)}|edges:{estr}|E"
         # 一般讀取：有摘要就回摘要（省 token），沒有就回原文截斷版
         rec = self.memory.recall(key)
         if rec:
@@ -1757,6 +1929,86 @@ def run_tests():
     # 統計
     s = mem.stats()
     S.check(s["count"] >= 3, "stats 計數正確")
+    S.check("tiers" in s, "stats 包含分層統計")
+
+    # ── 4c. v3.3 記憶分層測試 ──────────────────────────────
+    _head("4c. 記憶分層測試 (v3.3)")
+
+    # core 標籤記憶
+    mem.save("identity:name", "龍蝦小七", "core")
+    mem.save("identity:model", "qwen2.5:7b", "core")
+    mem.save("daily:weather", "今天台北晴天", "daily")
+    mem.save("cache:temp", "暫存資料", "cache")
+
+    # get_core_memories
+    cores = mem.get_core_memories()
+    S.check(len(cores) >= 2, "get_core_memories 取得 >=2 筆")
+    S.check(all("core" in r.tags.lower() for r in cores), "core 記憶 tags 正確")
+
+    # search 排序：core 優先
+    results = mem.search("identity")
+    S.check(len(results) >= 2, "搜尋 identity 命中 core 記憶")
+
+    # export_core
+    md = mem.export_core()
+    S.check("龍蝦小七" in md and "核心記憶匯出" in md, "export_core 匯出正確")
+
+    # cleanup_expired（不會刪 core）
+    # 先存一筆很舊的非 core 記憶
+    mem.save("old:data", "舊資料", "cache")
+    with mem._conn() as c:
+        c.execute("UPDATE lcp_memory SET updated_at='2020-01-01T00:00:00',access_count=0 WHERE key='old:data'")
+    deleted = mem.cleanup_expired(max_age_days=1)
+    S.check(deleted >= 1, "cleanup 清理過期非核心記憶")
+    S.check(mem.recall("identity:name") is not None, "cleanup 不刪 core 記憶")
+
+    # tier 統計
+    s2 = mem.stats()
+    S.check(s2["tiers"]["core"] >= 2, "tier 統計：core >= 2")
+    S.check(s2["tiers"]["daily"] >= 1, "tier 統計：daily >= 1")
+    S.check(s2["tiers"]["cache"] >= 1, "tier 統計：cache >= 1")
+
+    # ── 4d. v3.4 記憶圖譜測試 ──────────────────────────────
+    _head("4d. 記憶圖譜測試 (v3.4)")
+
+    # 準備測試資料：taipei 相關的一組記憶
+    mem.save("city:taipei", "台北市，台灣首都", "core,city")
+    mem.save("weather:taipei", "台北今日晴天28度", "daily,weather,taipei")
+    mem.save("food:taipei", "台北小籠包、牛肉麵", "daily,food,taipei")
+    mem.save("food:tainan", "台南擔仔麵、棺材板", "daily,food,tainan")
+    mem.save("city:tainan", "台南市，古都", "core,city")
+
+    # auto_link 應該自動建立關聯（same_tag: taipei, same_group: city:, food:）
+    gs = mem.graph_stats()
+    S.check(gs["edges"] > 0, "auto_link 自動建立邊")
+
+    # 手動 link
+    ok = mem.link("city:taipei", "weather:taipei", "has_weather")
+    S.check(ok, "手動 link 成功")
+
+    # get_edges
+    edges = mem.get_edges("city:taipei")
+    S.check(len(edges) >= 1, "get_edges 取得邊")
+
+    # get_related depth=1
+    related = mem.get_related("city:taipei", depth=1, limit=5)
+    S.check(len(related) >= 1, "get_related depth=1 有結果")
+    related_keys = [r[0].key for r in related]
+    S.check("weather:taipei" in related_keys or "city:tainan" in related_keys,
+            "get_related 找到關聯記憶")
+
+    # get_related depth=2（二度關聯）
+    related2 = mem.get_related("city:taipei", depth=2, limit=10)
+    S.check(len(related2) >= len(related), "depth=2 結果 >= depth=1")
+
+    # unlink
+    ok_ul = mem.unlink("city:taipei", "weather:taipei")
+    S.check(ok_ul, "unlink 成功")
+    S.check(not mem.unlink("not:exist", "neither:this"), "unlink 不存在回 False")
+
+    # graph_stats
+    gs2 = mem.graph_stats()
+    S.check(gs2["edges"] >= 0, "graph_stats 正常")
 
     mem.close()
     try: os.unlink(mem_path)
@@ -2001,6 +2253,9 @@ def main():
             print("  python lcp.py mem list [prefix]")
             print("  python lcp.py mem delete <key>")
             print("  python lcp.py mem stats")
+            print("  python lcp.py mem export           匯出核心記憶成 markdown")
+            print("  python lcp.py mem cleanup [days]    清理過期非核心記憶（預設90天）")
+            print("  python lcp.py mem tier <core|daily|cache>  查看特定分層")
             sys.exit(1)
         sub = args[1].lower()
         pf  = get_platform()
@@ -2014,6 +2269,8 @@ def main():
             if rec:
                 print(f"key:     {rec.key}")
                 print(f"value:   {rec.value}")
+                if rec.summary:
+                    print(f"summary: {rec.summary}")
                 print(f"tags:    {rec.tags}")
                 print(f"access:  {rec.access_count}")
                 print(f"updated: {rec.updated_at}")
@@ -2023,7 +2280,7 @@ def main():
             results = mem.search(" ".join(args[2:]))
             if results:
                 for r in results:
-                    val_preview = r.value[:80] + "..." if len(r.value) > 80 else r.value
+                    val_preview = r.summary or (r.value[:80] + "..." if len(r.value) > 80 else r.value)
                     print(f"  {r.key}  [{r.tags}]  →  {val_preview}")
             else:
                 print("沒有找到相關記憶")
@@ -2042,6 +2299,40 @@ def main():
             s = mem.stats()
             print(f"記憶總數：{s['count']}")
             print(f"總存取次數：{s['total_access']}")
+            print(f"分層統計：")
+            for tier, cnt in s["tiers"].items():
+                print(f"  {tier}: {cnt} 筆")
+        elif sub == "export":
+            md = mem.export_core()
+            out_path = pf.db_dir / "core_memory_export.md"
+            out_path.write_text(md, encoding="utf-8")
+            print(f"✅ 核心記憶已匯出至：{out_path}")
+            print(md[:500])
+        elif sub == "cleanup":
+            days = int(args[2]) if len(args) > 2 else 90
+            deleted = mem.cleanup_expired(max_age_days=days)
+            print(f"✅ 已清理 {deleted} 筆過期記憶（>{days}天 + access<3 + 非core）")
+        elif sub == "tier" and len(args) >= 3:
+            tier_name = args[2].lower()
+            results = mem.search(tier_name, limit=20)
+            # 過濾只顯示該 tier 的
+            filtered = [r for r in results if tier_name in r.tags.lower()]
+            if not filtered:
+                # fallback: 用 list 方式找
+                with mem._conn() as c:
+                    rows = c.execute(
+                        "SELECT * FROM lcp_memory WHERE LOWER(tags) LIKE ? ORDER BY updated_at DESC LIMIT 20",
+                        (f"%{tier_name}%",)).fetchall()
+                filtered = [MemoryRecord(r["key"], r["value"], r["summary"] or "",
+                                         r["tags"], r["created_at"], r["updated_at"],
+                                         r["access_count"]) for r in rows]
+            if filtered:
+                print(f"[{tier_name}] 分層記憶（{len(filtered)} 筆）：")
+                for r in filtered:
+                    preview = r.summary or (r.value[:60] + "..." if len(r.value) > 60 else r.value)
+                    print(f"  {r.key}  →  {preview}")
+            else:
+                print(f"[{tier_name}] 分層無記憶")
         else:
             print(f"未知子命令：{sub}")
 

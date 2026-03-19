@@ -29,6 +29,8 @@ AGENT_READ: true
 13. [專案結構 / Project Structure](#專案結構--project-structure)
 14. [混合模式 / Hybrid Mode](#混合模式--hybrid-mode)
 15. [記憶庫 / Memory Store](#記憶庫--memory-store-v32)
+16. [記憶分層 / Memory Tiers](#記憶分層--memory-tiers-v33)
+17. [記憶圖譜 / Memory Graph](#記憶圖譜--memory-graph-v34)
 
 ---
 
@@ -543,21 +545,21 @@ status:uncertain|confidence:x  → translation confidence too low
 ## 專案結構 / Project Structure
 
 ```
-lcp.py  (single file, ~2080 lines)
+lcp.py  (single file, ~2350 lines)
 │
 ├── §1   Constants & utilities
 ├── §2   Platform adapter       ← auto-detects macOS / WSL / Windows
 ├── §3   Challenge solver       ← obfuscated math auto-decode
 ├── §4   Translation store      ← SQLite + hot cache + lifecycle
-├── §4b  Memory store           ← SQLite persistent + dual-layer + auto-context
+├── §4b  Memory store           ← SQLite + dual-layer + auto-context + graph
 ├── §5   Sandbox                ← state machine + EA loop
 ├── §6   Ollama handler         ← local model calls + summarize + translate
 ├── §7   Moltbook watcher       ← API version tracking
 ├── §8   Moltbook handler       ← full official API implementation
 ├── §9   Translator             ← natural language → LCP
-├── §10  LCP parser             ← main entry + hybrid + auto-context matching
+├── §10  LCP parser             ← main entry + hybrid + auto-context + graph
 ├── §11  Setup tool             ← interactive setup wizard
-├── §12  Test suite             ← 85/86 pass (includes memory + hybrid tests)
+├── §12  Test suite             ← 104/105 pass (memory + graph + hybrid tests)
 └── §13  CLI                    ← python3 lcp.py <cmd>
 
 README.md    ← this file (human + agent readable)
@@ -821,12 +823,15 @@ L|RM|list:|E              → 列出所有 key
 L|RM|list:recipe:|E       → 列出 recipe: 開頭的 key
 L|RM|delete:key|E         → 刪除記憶
 L|RM|stats|E              → 記憶庫統計
+L|RM|graph:key|E          → 圖譜檢索：查看關聯記憶（v3.4）
+L|RM|link:src:tgt:rel|E   → 手動建立記憶關聯（v3.4）
+L|RM|edges:key|E          → 查看某筆記憶的所有邊（v3.4）
 ```
 
 ### CLI 記憶庫操作 / CLI Memory Commands
 
 ```bash
-# 存入記憶
+# 存入記憶（自動建立圖譜關聯）
 python3 lcp.py mem save weather_today "台北晴天28度" "weather,taipei"
 
 # 讀取記憶
@@ -835,17 +840,60 @@ python3 lcp.py mem get weather_today
 # 搜尋
 python3 lcp.py mem search "天氣"
 
-# 列出所有
+# 列出所有 / 列出特定前綴
 python3 lcp.py mem list
-
-# 列出特定前綴
 python3 lcp.py mem list recipe:
 
 # 刪除
 python3 lcp.py mem delete weather_today
 
-# 統計
+# 統計（含分層統計）
 python3 lcp.py mem stats
+
+# 匯出核心記憶成 markdown（災難恢復用）
+python3 lcp.py mem export
+
+# 清理過期非核心記憶（預設90天）
+python3 lcp.py mem cleanup
+python3 lcp.py mem cleanup 30
+
+# 查看特定分層
+python3 lcp.py mem tier core
+```
+
+---
+
+## 記憶分層 / Memory Tiers (v3.3)
+
+> 靈感來自 Adam Framework 5 層持久記憶架構
+
+```
+core   — 永不過期，永遠優先載入（像 Adam 的 SOUL.md）
+daily  — 日常記錄，90天+低存取自動清理
+cache  — 暫存，最先被清理
+
+搜尋排序：core 永遠最前 → 按 updated_at 降序 → 按 access_count
+過期清理：core 永遠不刪，其他 >90天 + access<3 自動清理
+核心匯出：python3 lcp.py mem export → markdown 備份
+```
+
+---
+
+## 記憶圖譜 / Memory Graph (v3.4)
+
+> 整合 code-review-graph 概念，記憶之間自動建立關聯網絡
+
+```
+存入記憶時自動觸發 auto_link：
+  相同 tag     → same_tag 關聯（weight=0.5）
+  相同 key前綴 → same_group 關聯（weight=0.8）
+
+_auto_context 三步驟：
+  1. [CORE] 載入核心記憶
+  2. [搜尋] 關鍵字匹配
+  3. [GRAPH] 對搜到的記憶做 1 度展開，帶出關聯記憶
+
+效果：查 taipei → 帶出天氣、食物、交通等同城市記憶
 ```
 
 ---
@@ -854,7 +902,8 @@ python3 lcp.py mem stats
 
 - [x] **Hybrid output mode (v3.1)** — internal LCP + external natural language
 - [x] **Persistent memory store (v3.2)** — real SQLite SK/RM + dual-layer + auto-context
-- [ ] **Memory layering (v3.3)** — core/daily/cache tiers + temporal decay (inspired by Adam Framework)
+- [x] **Memory layering (v3.3)** — core/daily/cache tiers + temporal decay + cleanup + export
+- [x] **Memory graph (v3.4)** — auto-link + depth traversal + graph-expanded context
 - [ ] **Signature verification** — HMAC per message, prevent tampering
 - [ ] **Version compatibility layer** — v1/v2 message auto-conversion
 - [ ] **State serialization** — resume execution after agent restart
@@ -870,10 +919,10 @@ Free to use and adapt. Attribution appreciated.
 
 ---
 
-*這隻龍蝦，是我親手養大的。—— 國裕 2026.03.18* 🦞  
-*This lobster was raised by hand. — Guoyu, 2026.03.18*
-#   l c p - l o b s t e r - v 3 
- 
- #   l c p - l o b s t e r - v 3 
- 
- 
+*這隻龍蝦，是我親手養大的。—— 國裕 2026.03.19* 🦞  
+*This lobster was raised by hand. — Guoyu, 2026.03.19*
+#   l c p - l o b s t e r - v 3 
+ 
+ #   l c p - l o b s t e r - v 3 
+ 
+ 
