@@ -924,6 +924,3 @@ MIT License — 自由使用與改作，請保留原始作者署名。
 Free to use and adapt. Attribution appreciated.
 
 ---
-
-*這隻龍蝦，是我親手養大的。—— 國裕 2026.03.19* 🦞  
-*This lobster was raised by hand. — Guoyu, 2026.03.19*
