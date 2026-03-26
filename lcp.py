@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# ── Windows UTF-8 強制設定（最早執行，避免 cp950 亂碼）──────────
+import sys
+if sys.platform == "win32":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+# ─────────────────────────────────────────────────────────────────
 """
 ╔══════════════════════════════════════════════════════════╗
 ║   LCP — Lobster Communication Protocol v3               ║
@@ -67,10 +74,10 @@ RESET  = "\033[0m"
 BOLD   = "\033[1m"
 
 def _c(text, color):  return f"{color}{text}{RESET}"
-def _ok(msg):         print(f"  {_c('✅', GREEN)} {msg}")
-def _err(msg):        print(f"  {_c('❌', RED)} {msg}")
-def _warn(msg):       print(f"  {_c('⚠️ ', YELLOW)} {msg}")
-def _info(msg):       print(f"  {_c('ℹ️ ', CYAN)} {msg}")
+def _ok(msg):         print(f"  {_c('[OK]',   GREEN)}  {msg}")
+def _err(msg):        print(f"  {_c('[ERR]',  RED)}   {msg}")
+def _warn(msg):       print(f"  {_c('[WARN]', YELLOW)} {msg}")
+def _info(msg):       print(f"  {_c('[INFO]', CYAN)}  {msg}")
 def _head(msg):       print(f"\n{BOLD}{_c(f'── {msg}', CYAN)}{RESET}")
 def _hr():            print("─" * 50)
 
@@ -136,6 +143,8 @@ def detect_platform() -> PlatformInfo:
             "http://localhost:11434", Path.home()/".lcp", "utf-8", "macOS")
 
     if sys.platform == "linux" and _is_wsl():
+        if not _port_open("localhost", 11434):
+            _warn("WSL 偵測到但 Ollama 未回應，請執行：wsl --status 確認狀態")
         return PlatformInfo(PlatformType.WSL,
             "http://localhost:11434", Path.home()/".lcp", "utf-8", "WSL (Ubuntu)")
 
