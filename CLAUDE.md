@@ -1,6 +1,6 @@
 # LCP 公告版 / LCP Project
-> 此目錄是 LCP v3.4 的主引擎 repo，與 skills/ 保持獨立。
-> This directory is the LCP v3.4 engine repo, kept separate from skills/.
+> 此目錄是 LCP v3.4 的主引擎 repo，與 09_Skills/ 保持獨立。
+> This directory is the LCP v3.4 engine repo, kept separate from 09_Skills/.
 
 ## 此專案是什麼 / What this project is
 
@@ -9,7 +9,7 @@
 
 ## 使用技能索引 / Related Skill
 
-詳細說明與接口索引：`D:\OpenClaw_Scripts\skills\lcp-core\SKILL.md`
+詳細說明與接口索引：`D:\OpenClaw_Scripts\09_Skills\lcp-core\SKILL.md`
 （此 CLAUDE.md 只記要點，完整文檔看 lcp-core/SKILL.md）
 
 ## 常用指令 / Quick Commands
