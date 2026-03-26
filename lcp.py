@@ -426,8 +426,20 @@ class MemoryStore:
     MAX_KEY_LEN   = 128
     SUMMARY_THRESHOLD = 150  # 超過此字數時觸發 AI 摘要
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, chroma_path: str = None):
         self.db_path = db_path
+        self._chroma_client = None
+        self._chroma_col = None
+        if chroma_path:
+            try:
+                import chromadb
+                self._chroma_client = chromadb.PersistentClient(path=chroma_path)
+                self._chroma_col = self._chroma_client.get_or_create_collection(
+                    name="lcp_memory",
+                    metadata={"hnsw:space": "cosine"}
+                )
+            except ImportError:
+                pass  # 降級到純關鍵字搜尋
         self._init_db()
 
     def _init_db(self):
@@ -491,6 +503,17 @@ class MemoryStore:
                       (key, value, summary, tags, ts, ts))
         # v3.4: 自動建立圖譜關聯
         self.auto_link(key)
+        # v3.5: 同步到 ChromaDB 語意索引
+        if self._chroma_col is not None:
+            try:
+                doc_text = f"{key} {value} {tags}"
+                self._chroma_col.upsert(
+                    documents=[doc_text],
+                    ids=[key],
+                    metadatas=[{"key": key, "tags": tags or ""}]
+                )
+            except Exception:
+                pass
         return True, "saved"
 
     def needs_summary(self, value: str) -> bool:
@@ -508,17 +531,14 @@ class MemoryStore:
                             row["tags"], row["created_at"], row["updated_at"],
                             row["access_count"])
 
-    def search(self, query: str, limit: int = 5) -> list:
+    def _keyword_search(self, query: str, limit: int = 5) -> list:
         """關鍵字搜尋 + 時間衰減排序
-        
+
         排序邏輯（借鑑 Adam Framework）：
         - core 標籤的記憶永遠排最前
         - 其他記憶按「時間衰減分數」排序：越新的分數越高
         - 同時間的按 access_count 排
         """
-        query = query.strip().lower()
-        if not query:
-            return []
         words = query.split()
         conditions = []
         params = []
@@ -537,6 +557,58 @@ class MemoryStore:
                              r["tags"], r["created_at"], r["updated_at"],
                              r["access_count"])
                 for r in rows]
+
+    def _semantic_search(self, query: str, limit: int = 5) -> list:
+        """ChromaDB 語意搜尋，回傳相似 key 列表（v3.5）"""
+        if self._chroma_col is None:
+            return []
+        try:
+            results = self._chroma_col.query(query_texts=[query], n_results=limit)
+            return results["ids"][0] if results["ids"] else []
+        except Exception:
+            return []
+
+    def search(self, query: str, limit: int = 5) -> list:
+        """v3.5 Hybrid Search：關鍵字 + 語意搜尋合併回傳
+
+        - keyword 結果優先（精確比對）
+        - ChromaDB 語意結果補足（搜「天氣」能找到「氣象、氣溫」）
+        - 若 chromadb 未安裝自動降級為純關鍵字
+        """
+        query = query.strip().lower()
+        if not query:
+            return []
+        keyword_results = self._keyword_search(query, limit)
+        semantic_keys = self._semantic_search(query, limit)
+        # 合併去重：keyword 優先，semantic 補足至 limit
+        seen = {r.key for r in keyword_results}
+        for key in semantic_keys:
+            if key not in seen and len(keyword_results) < limit:
+                rec = self.recall(key)
+                if rec:
+                    keyword_results.append(rec)
+                    seen.add(key)
+        return keyword_results[:limit]
+
+    def sync_to_chroma(self) -> int:
+        """將現有 SQLite 所有記憶批次同步到 ChromaDB（一次性遷移，v3.5）"""
+        if self._chroma_col is None:
+            return 0
+        with self._conn() as c:
+            rows = c.execute("SELECT key, value, tags FROM lcp_memory").fetchall()
+        count = 0
+        for row in rows:
+            key, value, tags = row["key"], row["value"], row["tags"] or ""
+            try:
+                self._chroma_col.upsert(
+                    documents=[f"{key} {value} {tags}"],
+                    ids=[key],
+                    metadatas=[{"key": key, "tags": tags}]
+                )
+                count += 1
+            except Exception:
+                pass
+        return count
 
     def get_core_memories(self, limit: int = 10) -> list:
         """取得所有 core 標籤的記憶（永遠優先載入）"""
@@ -583,6 +655,12 @@ class MemoryStore:
     def delete(self, key: str) -> bool:
         with self._conn() as c:
             cur = c.execute("DELETE FROM lcp_memory WHERE key=?", (key,))
+        # v3.5: 同步刪除 ChromaDB
+        if self._chroma_col is not None:
+            try:
+                self._chroma_col.delete(ids=[key])
+            except Exception:
+                pass
         return cur.rowcount > 0
 
     def list_keys(self, prefix: str = "", limit: int = 20) -> list:
@@ -1270,7 +1348,8 @@ class LCPParser:
         db   = str(pf.db_dir / "translation.db")
         mem_db = str(pf.db_dir / "memory.db")
         self.store      = TranslationStore(db)
-        self.memory     = MemoryStore(mem_db)
+        CHROMA_PATH = r"D:\OpenClaw_Scripts\10_MemoryDB\agent_memory_db"
+        self.memory     = MemoryStore(mem_db, chroma_path=CHROMA_PATH)
         self.ollama     = OllamaHandler()
         self.translator = Translator(self.store, self.ollama)
         self.sandbox    = Sandbox()
